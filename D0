@@ -1,0 +1,254 @@
+/* Consulta Leads D0 */ 
+
+WITH clientes_por_agente AS (
+  SELECT
+    DISTINCT ON (l.id) l.id AS lead_id,
+    concat(
+      p.names,
+      ' ',
+      p.first_surname,
+      ' ',
+      p.second_surname
+    ) AS name_client,
+    p.email,
+    CONCAT('+55',p.phone_number) as mobile_number_full,
+    /*CASE
+      WHEN LENGTH(p.mobile_number_full) >= 11 THEN concat('+',p.mobile_number_full)
+      WHEN LENGTH(p.phone_number) >= 10 THEN concat('+55', p.phone_number) -- Fallback a phone_number
+      ELSE NULL
+    END AS mobile_number_full,*/
+    -- Nombre original mantenido
+    l.stage,
+    l.inserted_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo' AS inserted_at,
+    l.last_registration_date AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo' AS last_registration_date,
+    l.uid AS uid
+  FROM
+    leads_lead l
+    LEFT JOIN crm_agent agent ON agent.id = l.agent_id
+    LEFT JOIN persons p ON p.id = l.person_id
+  WHERE
+    l.country = 'br'
+    AND l.agent_id = 9125 /* sustituir por {{actual_user.value}} */ 
+    AND l.last_registration_date IS NOT NULL
+    AND l.last_registration_date AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo' >= (NOW() AT TIME ZONE 'America/Sao_Paulo' - INTERVAL '24 HOURS')
+    AND l.stage NOT IN ('Otra línea de negocio', 'Cerrado Ganado')
+),
+lead_data AS (
+  SELECT
+    lc.lead_id,
+    string_agg(
+      DISTINCT NULLIF(TRIM(lc.meta ->> 'phone'), ''),
+      ', '
+    ) AS numeros_telefono,
+    string_agg(
+      DISTINCT NULLIF(
+        TRIM(lc.meta -> 'debts' -> 0 ->> 'debt_amount'),
+        ''
+      ),
+      ', '
+    ) AS montos_de_deuda,
+    string_agg(
+      DISTINCT NULLIF(
+        TRIM(lc.meta -> 'debts' -> 0 ->> 'borrower_institute'),
+        ''
+      ),
+      ', '
+    ) AS entidades
+  FROM
+    clientes_por_agente cpa
+    LEFT JOIN lead_cta lc ON cpa.lead_id = lc.lead_id
+  WHERE
+    NULLIF(TRIM(lc.meta ->> 'phone'), '') IS NOT NULL
+  GROUP BY
+    lc.lead_id
+),
+leads_activities AS (
+  SELECT
+    cpa.lead_id,
+    cal.inserted_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo' AS last_activity_date
+  FROM
+    clientes_por_agente cpa
+    LEFT JOIN LATERAL (
+      SELECT
+        *
+      FROM
+        crm_activity_log
+      WHERE
+        lead_id = cpa.lead_id
+        AND emitter_type = 'ard'
+        AND inserted_at >= CURRENT_DATE - INTERVAL '20 days'
+        AND NOT activity_metadata @> '{"provider": "Aircall"}' :: jsonb
+        AND NOT activity_metadata ->> 'note' = 'Llamada saliente desde AirCall'
+        AND (
+          activity_metadata ->> 'new_stage' IN ('No perfila', 'En espera', 'Perfila')
+          OR (
+            activity_metadata ->> 'note' IS NOT NULL
+            AND cpa.stage IN ('No perfila', 'En espera', 'Perfila')
+          )
+        )
+      ORDER BY
+        inserted_at DESC
+      LIMIT
+        1
+    ) cal ON TRUE
+  WHERE
+    cal.lead_id IS NULL
+),
+todos_los_pv AS (
+  SELECT
+    agent.level as rol,
+    agent.email
+  FROM
+    crm_agent agent
+  WHERE
+    agent.country = 'br'
+    AND agent.level = 'preventa'
+),
+llamadas_por_cliente AS (
+  SELECT
+    leadact.lead_id,
+    COUNT(ca.lead_id) AS call_count,
+    SUM(
+      CASE
+        WHEN EXTRACT(
+          HOUR
+          FROM
+            ca.started_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo'
+        ) BETWEEN 9
+        AND 11 THEN 1
+        ELSE 0
+      END
+    ) AS total_calls_9_to_12,
+    SUM(
+      CASE
+        WHEN EXTRACT(
+          HOUR
+          FROM
+            ca.started_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo'
+        ) BETWEEN 12
+        AND 14 THEN 1
+        ELSE 0
+      END
+    ) AS total_calls_12_to_15,
+    SUM(
+      CASE
+        WHEN EXTRACT(
+          HOUR
+          FROM
+            ca.started_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo'
+        ) BETWEEN 15
+        AND 17 THEN 1
+        ELSE 0
+      END
+    ) AS total_calls_15_to_18,
+    SUM(
+      CASE
+        WHEN EXTRACT(
+          HOUR
+          FROM
+            ca.started_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo'
+        ) BETWEEN 18
+        AND 23
+        OR EXTRACT(
+          HOUR
+          FROM
+            ca.started_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo'
+        ) BETWEEN 0
+        AND 8 THEN 1
+        ELSE 0
+      END
+    ) AS total_calls_18_onwards
+  FROM
+    leads_activities leadact
+    LEFT JOIN call_activities ca ON leadact.lead_id = ca.lead_id
+    JOIN todos_los_pv tlp ON ca.user_email = tlp.email
+  WHERE
+    CASE
+      WHEN EXTRACT(
+        DAY
+        FROM
+          CURRENT_DATE
+      ) <= 10 THEN ca.started_at >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month') + INTERVAL '21 days'
+      ELSE ca.started_at >= DATE_TRUNC('month', CURRENT_DATE)
+    END
+  GROUP BY
+    leadact.lead_id
+),
+horario_actual AS (
+  SELECT
+    EXTRACT(
+      HOUR
+      FROM
+        NOW() AT TIME ZONE 'America/Sao_Paulo'
+    ) AS current_hour
+),
+final AS (
+  SELECT
+    cpa.*,
+    ld.*,
+    COALESCE(lpc.call_count, 0) AS call_count,
+    COALESCE(lpc.total_calls_9_to_12, 0) AS total_calls_9_to_12,
+    COALESCE(lpc.total_calls_12_to_15, 0) AS total_calls_12_to_15,
+    COALESCE(lpc.total_calls_15_to_18, 0) AS total_calls_15_to_18,
+    COALESCE(lpc.total_calls_18_onwards, 0) AS total_calls_18_onwards,
+    EXTRACT(
+      HOUR
+      FROM
+        NOW() AT TIME ZONE 'America/Sao_Paulo'
+    ) AS current_hour,
+    'fresh' AS cycle_name
+  FROM
+    leads_activities leadact
+    LEFT JOIN clientes_por_agente cpa ON leadact.lead_id = cpa.lead_id
+    LEFT JOIN lead_data ld ON leadact.lead_id = ld.lead_id
+    LEFT JOIN llamadas_por_cliente lpc ON leadact.lead_id = lpc.lead_id
+    CROSS JOIN horario_actual ha
+  WHERE
+    (
+      (
+        (
+          ha.current_hour BETWEEN 9
+          AND 11
+          AND (
+            lpc.total_calls_9_to_12 IS NULL
+            OR lpc.total_calls_9_to_12 <= 1
+          )
+        )
+        OR (
+          ha.current_hour BETWEEN 12
+          AND 14
+          AND (
+            lpc.total_calls_12_to_15 IS NULL
+            OR lpc.total_calls_12_to_15 <= 1
+          )
+        )
+        OR (
+          ha.current_hour BETWEEN 15
+          AND 17
+          AND (
+            lpc.total_calls_15_to_18 IS NULL
+            OR lpc.total_calls_15_to_18 <= 1
+          )
+        )
+        OR (
+          ha.current_hour >= 18
+          AND (
+            lpc.total_calls_18_onwards IS NULL
+            OR lpc.total_calls_18_onwards <= 1
+          )
+        )
+      )
+      OR (
+        lpc.total_calls_9_to_12 IS NULL
+        AND lpc.total_calls_12_to_15 IS NULL
+        AND lpc.total_calls_15_to_18 IS NULL
+        AND lpc.total_calls_18_onwards IS NULL
+      )
+    )
+)
+SELECT
+  *
+FROM
+  final
+ORDER BY
+  last_registration_date DESC;
