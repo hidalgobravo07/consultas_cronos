@@ -1,0 +1,56 @@
+
+/* Variações de horário para a consulta Fresh Leads */ 
+
+/* D0 (24 horas atrás) */ 
+AND l.last_registration_date AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo' >= (NOW() AT TIME ZONE 'America/Sao_Paulo' - INTERVAL '24 HOURS')
+
+/* D1 (entre 24 e 48 horas atrás) */ 
+AND l.last_registration_date AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo' >= (NOW() AT TIME ZONE 'America/Sao_Paulo' - INTERVAL '48 HOURS')
+AND l.last_registration_date AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo' < (NOW() AT TIME ZONE 'America/Sao_Paulo' - INTERVAL '24 HOURS')
+
+/* D3 (entre 48 e 96 horas atrás) */
+AND l.last_registration_date AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo' >= (NOW() AT TIME ZONE 'America/Sao_Paulo' - INTERVAL '96 HOURS')
+AND l.last_registration_date AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo' < (NOW() AT TIME ZONE 'America/Sao_Paulo' - INTERVAL '48 HOURS')
+
+/* D5 (entre 96 e 144 horas atrás) */
+AND l.last_registration_date AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo' >= (NOW() AT TIME ZONE 'America/Sao_Paulo' - INTERVAL '144 HOURS')
+AND l.last_registration_date AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo' < (NOW() AT TIME ZONE 'America/Sao_Paulo' - INTERVAL '96 HOURS')
+
+
+/* Traer el bucket de mensajes sin contestar */ 
+
+WITH leads_wa AS (
+    SELECT 
+        l.id AS lead_id,
+        l.last_registration_date AT TIME ZONE 'UTC-6' AT TIME ZONE 'UTC-3' AS ultimo_registro,
+        DATE(CURRENT_DATE) - DATE(l.last_registration_date) AS dias_registro,
+        l.stage AS etapa_atual,
+        crm.email AS ard,
+        le.total_sent AS total_msg_enviadas,
+        le.total_received AS total_msg_recebidas,
+        le.last_date_sent AT TIME ZONE 'UTC-6' AT TIME ZONE 'UTC-3' AS ultima_data_envio,
+        le.last_date_received AT TIME ZONE 'UTC-6' AT TIME ZONE 'UTC-3' AS ultima_data_recebida,
+        CASE WHEN le.last_date_received > le.last_date_sent THEN 'Cliente sem resposta' ELSE 'Cliente respondido' END AS status_msg,
+        CASE WHEN le.total_sent >= 1 THEN 'tentativa_contato' ELSE 'sem_contacto' END AS contato_status,
+        CASE WHEN le.total_received >= 1 THEN 'cliente_respondeu' ELSE 'cliente_nao_respondeu' END AS cliente_contato_status,
+        CONCAT('https://vanex.io/opportunity/',l.uid) AS link_vanex
+    FROM  
+        leads_lead l 
+    -- LEFT JOIN 
+    --     lead_conversation_log wa ON wa.lead_id = l.id 
+    LEFT JOIN 
+        lead_conversation_accumulator le ON le.lead_id = l.id
+    LEFT JOIN
+        crm_agent AS crm ON crm.id = l.agent_id
+    LEFT JOIN 
+        crm_team AS t ON t.id = crm.team_id 
+    WHERE 
+        l.country = 'br'
+        AND l.last_registration_date AT TIME ZONE 'UTC-6' AT TIME ZONE 'UTC-3' >= DATE_TRUNC('month',CURRENT_DATE)
+        AND t.description = 'Bravissimo'
+    ORDER BY 
+        l.last_registration_date AT TIME ZONE 'UTC-6' AT TIME ZONE 'UTC-3' DESC
+    )
+    
+    SELECT * FROM leads_wa WHERE status_msg = 'Cliente sem resposta' AND etapa_atual <> 'No perfila' AND dias_registro <= 5 
+
